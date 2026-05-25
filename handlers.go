@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -20,18 +21,30 @@ import (
 )
 
 const (
-	sessCookieName  = "wt_sess"
-	adminCookieName = "wt_admin"
-	tokenParam      = "t"
-	maxEventsPerSession = 200
+	sessCookieName      = "wt_sess"
+	adminCookieName     = "wt_admin"
+	tokenParam          = "t"
+	maxEventsPerSession = 400
 )
 
 var (
-	loginLimiter   = newLimiter(5, time.Minute)
-	eventCounters  = &sessionCounter{m: map[string]int{}}
-	allowedPhases  = map[string]bool{
-		"sceneIntro": true, "scenePhase": true, "sceneCurve": true, "sceneFlywheel": true,
+	loginLimiter  = newLimiter(5, time.Minute)
+	eventCounters = &sessionCounter{m: map[string]int{}}
+
+	// Phases match the assessment's three scenes.
+	allowedPhases = map[string]bool{
+		"sceneIntro": true, "sceneScenario": true, "sceneResults": true,
 	}
+
+	// Scenario identifiers come from the embedded deck's `scenarios` array.
+	allowedScenarios = map[string]bool{
+		"network": true, "app": true, "cnapp": true, "sspm": true,
+	}
+
+	allowedColors = map[string]bool{"red": true, "yellow": true, "green": true}
+
+	emailRe    = regexp.MustCompile(`^[^@\s]{1,128}@[^@\s]{1,128}\.[^@\s]{1,32}$`)
+	mobileUARe = regexp.MustCompile(`(?i)(Mobile|Android|iPhone|iPad|iPod|Opera Mini|IEMobile|Mobi)`)
 )
 
 // ── helpers ──────────────────────────────────────────────────────────
@@ -59,9 +72,6 @@ func withLogging(h http.Handler) http.Handler {
 	})
 }
 
-// withSecurityHeaders applies hardening headers to every response. CSP locks
-// the deck and admin pages to same-origin + Google Fonts (the only external
-// resource either page loads).
 func withSecurityHeaders(h http.Handler) http.Handler {
 	const csp = "default-src 'self'; " +
 		"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
@@ -102,6 +112,18 @@ func clientIPHash(r *http.Request) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// pickDeck returns the right variant for the device. Prefers the explicit
+// `Sec-CH-UA-Mobile: ?1` client hint, falls back to UA string sniffing.
+func pickDeck(r *http.Request) []byte {
+	if r.Header.Get("Sec-CH-UA-Mobile") == "?1" {
+		return deckMobile
+	}
+	if mobileUARe.MatchString(r.UserAgent()) {
+		return deckMobile
+	}
+	return deckDesktop
+}
+
 // ── deck ─────────────────────────────────────────────────────────────
 
 func serveDeck(w http.ResponseWriter, r *http.Request) {
@@ -133,9 +155,6 @@ func serveDeck(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
-		// Session cookie is Path:"/" so /api/event sees it. The /admin/* routes
-		// never parse it as anything but a wt_admin cookie, and only typ:admin
-		// passes parseAdminSession. So this cookie cannot reach admin auth.
 		http.SetCookie(w, &http.Cookie{
 			Name: sessCookieName, Value: tok, Path: "/",
 			Expires: exp, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
@@ -146,7 +165,7 @@ func serveDeck(w http.ResponseWriter, r *http.Request) {
 
 	c, err := r.Cookie(sessCookieName)
 	if err != nil {
-		http.Error(w, "this walkthrough requires a valid link from the event QR code", http.StatusUnauthorized)
+		http.Error(w, "this assessment requires a valid link from the event QR code", http.StatusUnauthorized)
 		return
 	}
 	if _, err := parseSessionToken(c.Value); err != nil {
@@ -156,15 +175,22 @@ func serveDeck(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(deckHTML)
+	w.Header().Set("Vary", "User-Agent, Sec-CH-UA-Mobile")
+	_, _ = w.Write(pickDeck(r))
 }
 
 // ── /api/event ───────────────────────────────────────────────────────
 
 type eventPayload struct {
-	Event   string `json:"event"`
-	Phase   string `json:"phase,omitempty"`
-	DwellMs int    `json:"dwell_ms,omitempty"`
+	Event      string          `json:"event"`
+	Phase      string          `json:"phase,omitempty"`
+	DwellMs    int             `json:"dwell_ms,omitempty"`
+	Scenario   string          `json:"scenario,omitempty"`
+	OutcomeIdx int             `json:"outcome_idx"`
+	Score      int             `json:"score"`
+	Color      string          `json:"color,omitempty"`
+	Email      string          `json:"email,omitempty"`
+	Scores     json.RawMessage `json:"scores,omitempty"`
 }
 
 func recordEvent(w http.ResponseWriter, r *http.Request) {
@@ -186,7 +212,7 @@ func recordEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8192))
 	if err != nil {
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
@@ -201,26 +227,67 @@ func recordEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
+
 	switch p.Event {
+
 	case "phase_enter":
 		if !allowedPhases[p.Phase] {
 			http.Error(w, "unknown phase", http.StatusBadRequest)
 			return
 		}
+		if p.Scenario != "" && !allowedScenarios[p.Scenario] {
+			p.Scenario = ""
+		}
 		_, err = db.ExecContext(ctx,
-			`INSERT INTO phase_events(session_id, phase, entered_at, dwell_ms)
-			 VALUES ($1,$2,now(),$3)`,
-			sess.SessionID, p.Phase, p.DwellMs)
+			`INSERT INTO phase_events(session_id, phase, scenario, entered_at, dwell_ms)
+			 VALUES ($1,$2,NULLIF($3,''),now(),$4)`,
+			sess.SessionID, p.Phase, p.Scenario, p.DwellMs)
+
+	case "pick":
+		if !allowedScenarios[p.Scenario] {
+			http.Error(w, "unknown scenario", http.StatusBadRequest)
+			return
+		}
+		if p.OutcomeIdx < 0 || p.OutcomeIdx > 2 || p.Score < 0 || p.Score > 2 || !allowedColors[p.Color] {
+			http.Error(w, "invalid pick", http.StatusBadRequest)
+			return
+		}
+		_, err = db.ExecContext(ctx,
+			`INSERT INTO picks(session_id, scenario, outcome_idx, score, color)
+			 VALUES ($1,$2,$3,$4,$5)`,
+			sess.SessionID, p.Scenario, p.OutcomeIdx, p.Score, p.Color)
+
+	case "submit":
+		email := strings.TrimSpace(strings.ToLower(p.Email))
+		if !emailRe.MatchString(email) {
+			http.Error(w, "invalid email", http.StatusBadRequest)
+			return
+		}
+		if len(p.Scores) == 0 || len(p.Scores) > 4096 {
+			http.Error(w, "invalid scores", http.StatusBadRequest)
+			return
+		}
+		if !json.Valid(p.Scores) {
+			http.Error(w, "invalid scores", http.StatusBadRequest)
+			return
+		}
+		_, err = db.ExecContext(ctx,
+			`INSERT INTO submissions(session_id, email, scores)
+			 VALUES ($1,$2,$3)`,
+			sess.SessionID, email, []byte(p.Scores))
+
 	case "session_end":
 		_, err = db.ExecContext(ctx,
 			`UPDATE sessions SET ended_at = now() WHERE id = $1 AND ended_at IS NULL`,
 			sess.SessionID)
+
 	default:
 		http.Error(w, "unknown event", http.StatusBadRequest)
 		return
 	}
+
 	if err != nil {
-		log.Printf("event insert: %v", err)
+		log.Printf("event insert (%s): %v", p.Event, err)
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
 	}
@@ -238,8 +305,6 @@ func adminAuthed(r *http.Request) bool {
 	return err == nil
 }
 
-// authorizeAdmin accepts EITHER an admin browser session OR a bearer ADMIN_TOKEN
-// (for CI/scripts). Attendee cookies (wt_sess / typ:sess) never satisfy this.
 func authorizeAdmin(r *http.Request) bool {
 	if adminAuthed(r) {
 		return true
@@ -485,3 +550,4 @@ func truncate(s string, n int) string {
 	}
 	return s
 }
+

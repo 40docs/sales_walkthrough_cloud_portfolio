@@ -1,109 +1,108 @@
-# Cloud Security Portfolio Walkthrough
+# Sales Cloud Assessment (k8s-hosted)
 
-5-minute, seller-led, in-person presentation deck for the Fortinet cloud
-security portfolio. Two deploy targets share one source file
-(`cloud_portfolio.html`):
+Containerized, auth-gated, telemetry-collecting deploy of the 4-scenario
+**Security Maturity Assessment** plus a password-protected admin portal
+for minting per-event QR tokens.
 
-| Target               | Workflow            | Auth                  | Telemetry |
-| -------------------- | ------------------- | --------------------- | --------- |
-| GitHub Pages preview | `.github/pages.yml` | none                  | no-op     |
-| Container (k8s)      | `.github/build.yml` | per-link signed token | yes       |
+The assessment HTML files (`security-maturity-assessment-browser.html`,
+`security-maturity-assessment-mobile.html`) are kept as the source of truth
+in upstream [`40docs/sales_cloud-assessment`](https://github.com/40docs/sales_cloud-assessment).
+This repo embeds them at build time and serves the right variant per device.
 
 ## Container shape
 
-Single Go binary embedding the deck. Three surfaces, isolated from each other:
+Single Go binary embedding both variants. Three surfaces, isolated from each other:
 
 ```
                 ┌──────────────────────────────────────────────────────┐
+  QR scan ────► │  GET  /             Verifies ?t=, sets wt_sess,      │
+                │                     picks browser/mobile variant     │
+                │  POST /api/event    phase_enter / pick / submit /    │
+                │                     session_end (write-only)         │
                 │                                                      │
-  QR scan ────► │  GET  /             Verifies ?t=, sets wt_sess       │
-                │  POST /api/event    Telemetry (write-only)           │
-                │                                                      │
-  Admin in   ─► │  GET  /admin        Portal (wt_admin cookie required)│
+  Admin in   ─► │  GET  /admin        Mint UI                          │
   browser       │  GET  /admin/login                                   │
                 │  POST /admin/login  Password-gated, rate-limited     │
-                │  POST /admin/logout                                  │
-                │  POST /admin/mint   Mints event tokens               │
+                │  POST /admin/mint   Issues per-event URL tokens      │
                 │  GET  /admin/qr     Renders QR PNG                   │
+                │  POST /admin/logout                                  │
                 │                                                      │
   CLI / CI   ─► │  POST /admin/mint   Bearer ADMIN_TOKEN               │
                 └──────────────────────────────────────────────────────┘
 ```
 
+## Device variant selection
+
+Server-side, no client-side router:
+
+1. `Sec-CH-UA-Mobile: ?1` client hint → serve mobile.
+2. Otherwise, UA string contains `Mobile|Android|iPhone|iPad|iPod|Mobi|Opera Mini|IEMobile` → serve mobile.
+3. Else → serve browser (desktop).
+
+Response sets `Vary: User-Agent, Sec-CH-UA-Mobile` so caches store both variants correctly.
+
+## Telemetry captured per session
+
+| Event          | Trigger                                      | Stored in       |
+| -------------- | -------------------------------------------- | --------------- |
+| `phase_enter`  | Scene transitions (intro / scenario / results) | `phase_events` |
+| `pick`         | Each scenario outcome selected               | `picks`         |
+| `submit`       | Email submission on results screen           | `submissions`   |
+| `session_end`  | Tab/window close                             | updates `sessions.ended_at` |
+
+The assessment HTML is patched with a small `<script>` block that wraps
+`goTo()`, `pick()`, and `sendReport()` and emits these via `navigator.sendBeacon`.
+The patch is reapplied on every sync from upstream.
+
 ## Security model
-
-The thing the user-facing deck can do: **post telemetry events** through a
-session cookie minted from a valid event link. That's it.
-
-### Isolation between surfaces
 
 | Surface         | Cookie         | Path scope | Token `typ` / `aud`                  |
 | --------------- | -------------- | ---------- | ------------------------------------ |
 | Attendee deck   | `wt_sess`      | `/`        | `sess` / `walkthrough-session`       |
 | Admin portal    | `wt_admin`     | `/admin`   | `admin` / `walkthrough-admin`        |
-| CLI mint        | _none_         | _none_     | bearer `ADMIN_TOKEN` (env-injected)  |
+| CLI mint        | _none_         | _none_     | bearer `ADMIN_TOKEN`                 |
 
-Every JWT carries a `typ` and a JWT-validated `aud`. The admin parser only
-accepts `typ=admin && aud=walkthrough-admin`; the session parser only accepts
-`typ=sess && aud=walkthrough-session`. An attendee session cookie cannot pass
-admin auth even if it were somehow presented to `/admin/*`.
+The deck cookie cannot satisfy admin auth (token parser checks `aud` + `typ`).
+The admin cookie is path-scoped to `/admin` and `SameSite=Strict`. CLI bearer
+is verified with `crypto/subtle.ConstantTimeCompare`.
 
-### Hardening in this build
+### Other defenses
 
-- **Stateless EdDSA-signed JWTs** for every auth path; one signing key,
-  rotated by replacing the `JWT_PRIVATE_KEY` secret.
-- **Admin password** verified with `crypto/subtle.ConstantTimeCompare`.
-- **Per-IP rate limit** on `/admin/login` (5 failures / minute).
-- **Per-session rate limit** on `/api/event` (max 200 events).
-- **Input validation**: `/api/event` only accepts a known event enum and a
-  scene-ID allowlist; `/admin/mint` caps field lengths and window length
-  (≤ 30 days).
-- **Security headers** on every response: strict CSP (same-origin + Google
-  Fonts only), `Strict-Transport-Security`, `X-Frame-Options: DENY`,
-  `X-Content-Type-Options: nosniff`, `Referrer-Policy: same-origin`,
-  `Permissions-Policy` disabling camera/mic/geo.
-- **Cookies**: `HttpOnly`, `Secure`, `SameSite=Strict` for admin /
-  `SameSite=Lax` for the attendee session (required for the QR-driven
-  navigation). Admin cookie path-scoped to `/admin`.
-- **Audit logging** for admin login (success + failure with IP) and mint
-  operations (event, presenter, window, IP).
-- **Pod hardening**: distroless static image, non-root (UID 65532),
-  read-only root filesystem, all Linux capabilities dropped,
-  `seccompProfile: RuntimeDefault`, no service-account token mounted.
-- **NetworkPolicy**: ingress from the nginx-ingress namespace only;
-  egress to the CNPG Postgres pod, DNS, and outbound 443 only (so the
-  pod can't initiate connections to arbitrary internal services).
-- **Optional admin IP allowlist**: a second Ingress with
-  `whitelist-source-range` over `/admin/*` so the portal is only reachable
-  from corporate egress (the deck stays open for attendees).
-- **PodDisruptionBudget** keeps at least one replica during drains.
-
-### What the deck explicitly cannot do
-
-- Reach `/admin/*` — its cookie fails `parseAdminSession` (typ/aud mismatch).
-- Reach `/admin/mint` — neither cookie nor a bearer of `ADMIN_TOKEN` is
-  present; both checks fail.
-- Send arbitrary phase names — only the 4 deck scene IDs are accepted.
-- Spam telemetry — rate-limited per session.
-- Read its own session cookie — `HttpOnly` blocks JS access.
+- **Strict CSP** + HSTS + `X-Frame-Options: DENY` + `nosniff` + Referrer-Policy + Permissions-Policy on every response.
+- **Input validation** on `/api/event`: phase allowlist, scenario allowlist (`network/app/cnapp/sspm`), `outcome_idx 0..2`, `score 0..2`, color in `{red,yellow,green}`, email regex, `scores` jsonb ≤ 4 KB.
+- **Rate limits**: per-IP login limiter (5/min), per-session event cap (400 events).
+- **Pod**: distroless static, non-root, read-only rootfs, all caps dropped, `seccompProfile: RuntimeDefault`, no service-account token mounted.
+- **NetworkPolicy**: ingress from `ingress-nginx` ns only; egress to CNPG Postgres pod, DNS, and 443 only.
+- **Optional admin IP allowlist** via a separate Ingress with `whitelist-source-range` over `/admin/*`.
+- **PodDisruptionBudget**: minAvailable=1.
+- **Audit log** for admin login (success + fail with IP) and every mint.
 
 ## Endpoints
 
-| Path               | Auth                                | Purpose                                        |
-| ------------------ | ----------------------------------- | ---------------------------------------------- |
-| `GET /`            | URL `?t=<JWT>` or `wt_sess` cookie  | Verifies token, sets cookie, serves deck       |
-| `POST /api/event`  | `wt_sess` cookie                    | `phase_enter` / `session_end` from `sendBeacon`|
-| `GET /admin`       | `wt_admin` cookie                   | Portal UI                                      |
-| `GET /admin/login` | none                                | Login form                                     |
-| `POST /admin/login`| password form field                 | Authenticates, sets `wt_admin`                 |
-| `POST /admin/logout`| `wt_admin` cookie                  | Clears cookie                                  |
-| `POST /admin/mint` | `wt_admin` cookie OR bearer token   | Mints per-event URL token                      |
-| `GET /admin/qr`    | `wt_admin` cookie                   | PNG QR of supplied URL                         |
-| `GET /healthz`     | none                                | Liveness                                       |
+| Path                | Auth                              | Purpose                                            |
+| ------------------- | --------------------------------- | -------------------------------------------------- |
+| `GET /`             | URL `?t=` or `wt_sess`            | Mint session + serve device-appropriate assessment |
+| `POST /api/event`   | `wt_sess`                         | Telemetry — phase/pick/submit/session-end          |
+| `GET /admin`        | `wt_admin`                        | Portal UI                                          |
+| `GET /admin/login`  | none                              | Login form                                         |
+| `POST /admin/login` | password (form field)             | Sets `wt_admin`                                    |
+| `POST /admin/logout`| `wt_admin`                        | Clears cookie                                      |
+| `POST /admin/mint`  | `wt_admin` OR bearer token        | Mints per-event URL token                          |
+| `GET /admin/qr`     | `wt_admin`                        | PNG QR of supplied URL                             |
+| `GET /healthz`      | none                              | Liveness                                           |
 
 ## Deploy
 
-See [`chart/README.md`](chart/README.md).
+See [`chart/README.md`](chart/README.md) for `helm install` instructions.
+
+## Sync from upstream
+
+```bash
+UP=https://raw.githubusercontent.com/40docs/sales_cloud-assessment/main
+curl -sSL $UP/security-maturity-assessment-browser.html > security-maturity-assessment-browser.html
+curl -sSL $UP/security-maturity-assessment-mobile.html  > security-maturity-assessment-mobile.html
+# Re-apply telemetry script (see git log for the snippet) and commit.
+```
 
 ## Local dev
 

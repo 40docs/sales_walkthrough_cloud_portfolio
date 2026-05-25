@@ -13,8 +13,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-//go:embed cloud_portfolio.html
-var deckHTML []byte
+//go:embed security-maturity-assessment-browser.html
+var deckDesktop []byte
+
+//go:embed security-maturity-assessment-mobile.html
+var deckMobile []byte
 
 //go:embed admin/login.html admin/portal.html
 var adminFS embed.FS
@@ -56,20 +59,15 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", okHandler)
 
-	// Attendee surface — write-only telemetry. No admin paths reachable.
 	mux.HandleFunc("/api/event", recordEvent)
 
-	// Admin surface — password login, separate cookie scoped to /admin.
 	mux.HandleFunc("/admin", adminPortal)
-	// Anything else under /admin that isn't a registered exact route is 404.
-	// Longer registered paths (/admin/login, /admin/mint, ...) win over this.
 	mux.HandleFunc("/admin/", http.NotFound)
 	mux.HandleFunc("/admin/login", adminLogin)
 	mux.HandleFunc("/admin/logout", adminLogout)
 	mux.HandleFunc("/admin/mint", adminMint)
 	mux.HandleFunc("/admin/qr", adminQR)
 
-	// Deck served at /
 	mux.HandleFunc("/", serveDeck)
 
 	srv := &http.Server{
