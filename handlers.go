@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -11,15 +12,29 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"rsc.io/qr"
 )
 
 const (
-	cookieName = "wt_sess"
-	tokenParam = "t"
+	sessCookieName  = "wt_sess"
+	adminCookieName = "wt_admin"
+	tokenParam      = "t"
+	maxEventsPerSession = 200
 )
+
+var (
+	loginLimiter   = newLimiter(5, time.Minute)
+	eventCounters  = &sessionCounter{m: map[string]int{}}
+	allowedPhases  = map[string]bool{
+		"sceneIntro": true, "scenePhase": true, "sceneCurve": true, "sceneFlywheel": true,
+	}
+)
+
+// ── helpers ──────────────────────────────────────────────────────────
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -40,11 +55,35 @@ func withLogging(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		h.ServeHTTP(w, r)
-		log.Printf("%s %s %s %s", r.Method, r.URL.Path, r.RemoteAddr, time.Since(start))
+		log.Printf("%s %s ip=%s dur=%s", r.Method, r.URL.Path, clientIP(r), time.Since(start))
 	})
 }
 
-func clientIPHash(r *http.Request) string {
+// withSecurityHeaders applies hardening headers to every response. CSP locks
+// the deck and admin pages to same-origin + Google Fonts (the only external
+// resource either page loads).
+func withSecurityHeaders(h http.Handler) http.Handler {
+	const csp = "default-src 'self'; " +
+		"style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+		"font-src 'self' https://fonts.gstatic.com; " +
+		"img-src 'self' data: blob:; " +
+		"script-src 'self' 'unsafe-inline'; " +
+		"connect-src 'self'; " +
+		"frame-ancestors 'none'; " +
+		"base-uri 'self'; " +
+		"form-action 'self'"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", csp)
+		w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		h.ServeHTTP(w, r)
+	})
+}
+
+func clientIP(r *http.Request) string {
 	ip := r.Header.Get("X-Forwarded-For")
 	if i := strings.Index(ip, ","); i > 0 {
 		ip = ip[:i]
@@ -54,10 +93,16 @@ func clientIPHash(r *http.Request) string {
 		host, _, _ := net.SplitHostPort(r.RemoteAddr)
 		ip = host
 	}
+	return ip
+}
+
+func clientIPHash(r *http.Request) string {
 	salt := envOr("IP_SALT", "wt")
-	sum := sha256.Sum256([]byte(salt + ":" + ip))
+	sum := sha256.Sum256([]byte(salt + ":" + clientIP(r)))
 	return hex.EncodeToString(sum[:])[:16]
 }
+
+// ── deck ─────────────────────────────────────────────────────────────
 
 func serveDeck(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
@@ -77,7 +122,7 @@ func serveDeck(w http.ResponseWriter, r *http.Request) {
 		if _, err := db.ExecContext(ctx,
 			`INSERT INTO sessions(id, event_id, presenter_id, ua, ip_hash, started_at)
 			 VALUES ($1,$2,$3,$4,$5,now())`,
-			sid, urlC.EventID, urlC.PresenterID, r.UserAgent(), clientIPHash(r)); err != nil {
+			sid, urlC.EventID, urlC.PresenterID, truncate(r.UserAgent(), 256), clientIPHash(r)); err != nil {
 			log.Printf("session insert: %v", err)
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
@@ -88,15 +133,18 @@ func serveDeck(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "server error", http.StatusInternalServerError)
 			return
 		}
+		// Session cookie is Path:"/" so /api/event sees it. The /admin/* routes
+		// never parse it as anything but a wt_admin cookie, and only typ:admin
+		// passes parseAdminSession. So this cookie cannot reach admin auth.
 		http.SetCookie(w, &http.Cookie{
-			Name: cookieName, Value: tok, Path: "/",
+			Name: sessCookieName, Value: tok, Path: "/",
 			Expires: exp, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 		})
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 
-	c, err := r.Cookie(cookieName)
+	c, err := r.Cookie(sessCookieName)
 	if err != nil {
 		http.Error(w, "this walkthrough requires a valid link from the event QR code", http.StatusUnauthorized)
 		return
@@ -108,9 +156,10 @@ func serveDeck(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
 	_, _ = w.Write(deckHTML)
 }
+
+// ── /api/event ───────────────────────────────────────────────────────
 
 type eventPayload struct {
 	Event   string `json:"event"`
@@ -123,7 +172,7 @@ func recordEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	c, err := r.Cookie(cookieName)
+	c, err := r.Cookie(sessCookieName)
 	if err != nil {
 		http.Error(w, "no session", http.StatusUnauthorized)
 		return
@@ -131,6 +180,10 @@ func recordEvent(w http.ResponseWriter, r *http.Request) {
 	sess, err := parseSessionToken(c.Value)
 	if err != nil {
 		http.Error(w, "invalid session", http.StatusUnauthorized)
+		return
+	}
+	if !eventCounters.allow(sess.SessionID, maxEventsPerSession) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 4096))
@@ -143,10 +196,17 @@ func recordEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	if p.DwellMs < 0 || p.DwellMs > 86_400_000 {
+		p.DwellMs = 0
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 	defer cancel()
 	switch p.Event {
 	case "phase_enter":
+		if !allowedPhases[p.Phase] {
+			http.Error(w, "unknown phase", http.StatusBadRequest)
+			return
+		}
 		_, err = db.ExecContext(ctx,
 			`INSERT INTO phase_events(session_id, phase, entered_at, dwell_ms)
 			 VALUES ($1,$2,now(),$3)`,
@@ -165,6 +225,111 @@ func recordEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── admin portal ─────────────────────────────────────────────────────
+
+func adminAuthed(r *http.Request) bool {
+	c, err := r.Cookie(adminCookieName)
+	if err != nil {
+		return false
+	}
+	_, err = parseAdminSession(c.Value)
+	return err == nil
+}
+
+// authorizeAdmin accepts EITHER an admin browser session OR a bearer ADMIN_TOKEN
+// (for CI/scripts). Attendee cookies (wt_sess / typ:sess) never satisfy this.
+func authorizeAdmin(r *http.Request) bool {
+	if adminAuthed(r) {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return false
+	}
+	want := os.Getenv("ADMIN_TOKEN")
+	if want == "" {
+		return false
+	}
+	got := strings.TrimPrefix(auth, "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+func renderLogin(w http.ResponseWriter, status int, errMsg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_ = adminLoginTpl.Execute(w, map[string]string{"Err": errMsg})
+}
+
+func adminPortal(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/admin" {
+		http.NotFound(w, r)
+		return
+	}
+	if !adminAuthed(r) {
+		http.Redirect(w, r, "/admin/login", http.StatusFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = adminPortalTpl.Execute(w, nil)
+}
+
+func adminLogin(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		if adminAuthed(r) {
+			http.Redirect(w, r, "/admin", http.StatusFound)
+			return
+		}
+		renderLogin(w, http.StatusOK, "")
+	case http.MethodPost:
+		ip := clientIP(r)
+		if !loginLimiter.allow(ip) {
+			renderLogin(w, http.StatusTooManyRequests, "Too many attempts — try again in a minute.")
+			return
+		}
+		if err := r.ParseForm(); err != nil {
+			renderLogin(w, http.StatusBadRequest, "Bad request.")
+			return
+		}
+		pw := r.FormValue("password")
+		want := os.Getenv("ADMIN_PASSWORD")
+		if want == "" || subtle.ConstantTimeCompare([]byte(pw), []byte(want)) != 1 {
+			loginLimiter.fail(ip)
+			log.Printf("admin login FAIL ip=%s", ip)
+			renderLogin(w, http.StatusUnauthorized, "Invalid password.")
+			return
+		}
+		exp := time.Now().Add(8 * time.Hour)
+		tok, err := mintAdminSession(exp)
+		if err != nil {
+			http.Error(w, "server error", http.StatusInternalServerError)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name: adminCookieName, Value: tok, Path: "/admin",
+			Expires: exp, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+		})
+		log.Printf("admin login OK ip=%s", ip)
+		http.Redirect(w, r, "/admin", http.StatusFound)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func adminLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: adminCookieName, Value: "", Path: "/admin",
+		MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode,
+	})
+	http.Redirect(w, r, "/admin/login", http.StatusFound)
 }
 
 type mintRequest struct {
@@ -186,8 +351,7 @@ func adminMint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") || strings.TrimPrefix(auth, "Bearer ") != os.Getenv("ADMIN_TOKEN") {
+	if !authorizeAdmin(r) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
@@ -196,8 +360,13 @@ func adminMint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	if req.EventID == "" {
-		http.Error(w, "event_id required", http.StatusBadRequest)
+	req.EventID = strings.TrimSpace(req.EventID)
+	if req.EventID == "" || len(req.EventID) > 128 {
+		http.Error(w, "event_id required (1-128 chars)", http.StatusBadRequest)
+		return
+	}
+	if len(req.EventName) > 256 || len(req.PresenterID) > 128 {
+		http.Error(w, "field too long", http.StatusBadRequest)
 		return
 	}
 	nbf := time.Now()
@@ -218,15 +387,101 @@ func adminMint(w http.ResponseWriter, r *http.Request) {
 		}
 		exp = t
 	}
+	if exp.Before(nbf) || exp.Sub(nbf) > 30*24*time.Hour {
+		http.Error(w, "invalid time window (max 30 days)", http.StatusBadRequest)
+		return
+	}
 	tok, err := mintURLToken(req.EventID, req.EventName, req.PresenterID, nbf, exp, req.MaxUses)
 	if err != nil {
 		http.Error(w, "mint failed", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("admin mint event=%q presenter=%q nbf=%s exp=%s ip=%s",
+		req.EventID, req.PresenterID, nbf.Format(time.RFC3339), exp.Format(time.RFC3339), clientIP(r))
 	resp := mintResponse{Token: tok}
 	if base := envOr("PUBLIC_URL", ""); base != "" {
 		resp.URL = strings.TrimRight(base, "/") + "/?t=" + tok
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func adminQR(w http.ResponseWriter, r *http.Request) {
+	if !adminAuthed(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	data := r.URL.Query().Get("data")
+	if data == "" || len(data) > 2048 {
+		http.Error(w, "bad data", http.StatusBadRequest)
+		return
+	}
+	code, err := qr.Encode(data, qr.M)
+	if err != nil {
+		http.Error(w, "qr encode failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(code.PNG())
+}
+
+// ── rate limiting & misc ─────────────────────────────────────────────
+
+type limiter struct {
+	mu    sync.Mutex
+	max   int
+	win   time.Duration
+	fails map[string][]time.Time
+}
+
+func newLimiter(max int, win time.Duration) *limiter {
+	return &limiter{max: max, win: win, fails: map[string][]time.Time{}}
+}
+
+func (l *limiter) prune(key string) []time.Time {
+	now := time.Now()
+	cutoff := now.Add(-l.win)
+	out := l.fails[key][:0]
+	for _, t := range l.fails[key] {
+		if t.After(cutoff) {
+			out = append(out, t)
+		}
+	}
+	l.fails[key] = out
+	return out
+}
+
+func (l *limiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.prune(key)) < l.max
+}
+
+func (l *limiter) fail(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.fails[key] = append(l.fails[key], time.Now())
+}
+
+type sessionCounter struct {
+	mu sync.Mutex
+	m  map[string]int
+}
+
+func (s *sessionCounter) allow(id string, max int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m[id] >= max {
+		return false
+	}
+	s.m[id]++
+	return true
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }

@@ -17,7 +17,15 @@ var (
 	verifyKey ed25519.PublicKey
 )
 
-const jwtAlg = "EdDSA"
+const (
+	jwtAlg          = "EdDSA"
+	audURL          = "walkthrough-link"
+	audSession      = "walkthrough-session"
+	audAdmin        = "walkthrough-admin"
+	typURL          = "url"
+	typSession      = "sess"
+	typAdmin        = "admin"
+)
 
 type urlClaims struct {
 	jwt.RegisteredClaims
@@ -34,6 +42,11 @@ type sessClaims struct {
 	EventID     string `json:"eid"`
 	PresenterID string `json:"pid,omitempty"`
 	Typ         string `json:"typ"`
+}
+
+type adminClaims struct {
+	jwt.RegisteredClaims
+	Typ string `json:"typ"`
 }
 
 func loadKeys() error {
@@ -53,71 +66,92 @@ func loadKeys() error {
 	return nil
 }
 
+func sign(c jwt.Claims) (string, error) {
+	return jwt.NewWithClaims(jwt.SigningMethodEdDSA, c).SignedString(signKey)
+}
+
+func parseInto(raw string, dst jwt.Claims, expectedAud string) error {
+	_, err := jwt.ParseWithClaims(raw, dst,
+		func(t *jwt.Token) (interface{}, error) { return verifyKey, nil },
+		jwt.WithValidMethods([]string{jwtAlg}),
+		jwt.WithAudience(expectedAud),
+		jwt.WithIssuer("walkthrough"),
+	)
+	return err
+}
+
 func mintURLToken(eventID, eventName, presenterID string, nbf, exp time.Time, maxUses int) (string, error) {
-	c := urlClaims{
+	return sign(urlClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    "walkthrough",
-			Subject:   presenterID,
+			Issuer: "walkthrough", Subject: presenterID,
+			Audience:  jwt.ClaimStrings{audURL},
 			ID:        uuid.NewString(),
 			NotBefore: jwt.NewNumericDate(nbf),
 			ExpiresAt: jwt.NewNumericDate(exp),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
-		EventID:     eventID,
-		EventName:   eventName,
-		PresenterID: presenterID,
-		MaxUses:     maxUses,
-		Typ:         "url",
-	}
-	return jwt.NewWithClaims(jwt.SigningMethodEdDSA, c).SignedString(signKey)
+		EventID: eventID, EventName: eventName, PresenterID: presenterID,
+		MaxUses: maxUses, Typ: typURL,
+	})
 }
 
 func parseURLToken(raw string) (*urlClaims, error) {
 	var c urlClaims
-	_, err := jwt.ParseWithClaims(raw, &c,
-		func(t *jwt.Token) (interface{}, error) { return verifyKey, nil },
-		jwt.WithValidMethods([]string{jwtAlg}),
-	)
-	if err != nil {
+	if err := parseInto(raw, &c, audURL); err != nil {
 		return nil, err
 	}
-	if c.Typ != "url" {
-		return nil, errors.New("not a url token")
+	if c.Typ != typURL {
+		return nil, errors.New("token type mismatch")
 	}
 	return &c, nil
 }
 
 func mintSessionToken(sessionID, eventID, presenterID string, exp time.Time) (string, error) {
-	c := sessClaims{
+	return sign(sessClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Issuer:    "walkthrough",
+			Audience:  jwt.ClaimStrings{audSession},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(exp),
 		},
-		SessionID:   sessionID,
-		EventID:     eventID,
-		PresenterID: presenterID,
-		Typ:         "sess",
-	}
-	return jwt.NewWithClaims(jwt.SigningMethodEdDSA, c).SignedString(signKey)
+		SessionID: sessionID, EventID: eventID, PresenterID: presenterID, Typ: typSession,
+	})
 }
 
 func parseSessionToken(raw string) (*sessClaims, error) {
 	var c sessClaims
-	_, err := jwt.ParseWithClaims(raw, &c,
-		func(t *jwt.Token) (interface{}, error) { return verifyKey, nil },
-		jwt.WithValidMethods([]string{jwtAlg}),
-	)
-	if err != nil {
+	if err := parseInto(raw, &c, audSession); err != nil {
 		return nil, err
 	}
-	if c.Typ != "sess" {
-		return nil, errors.New("not a sess token")
+	if c.Typ != typSession {
+		return nil, errors.New("token type mismatch")
 	}
 	return &c, nil
 }
 
-// GenerateSeed prints a fresh ed25519 seed (used once at install time).
+func mintAdminSession(exp time.Time) (string, error) {
+	return sign(adminClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "walkthrough",
+			Audience:  jwt.ClaimStrings{audAdmin},
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			ExpiresAt: jwt.NewNumericDate(exp),
+		},
+		Typ: typAdmin,
+	})
+}
+
+func parseAdminSession(raw string) (*adminClaims, error) {
+	var c adminClaims
+	if err := parseInto(raw, &c, audAdmin); err != nil {
+		return nil, err
+	}
+	if c.Typ != typAdmin {
+		return nil, errors.New("token type mismatch")
+	}
+	return &c, nil
+}
+
 func GenerateSeed() (string, error) {
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {

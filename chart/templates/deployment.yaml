@@ -11,6 +11,7 @@ spec:
     metadata:
       labels: {{- include "walkthrough.selectorLabels" . | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: walkthrough
@@ -34,6 +35,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "walkthrough.fullname" . }}-secrets
                   key: jwtPrivateKey
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walkthrough.fullname" . }}-secrets
+                  key: adminPassword
             - name: ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:
