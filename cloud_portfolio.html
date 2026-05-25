@@ -493,5 +493,33 @@ document.addEventListener('keydown',e=>{
 
 show();
 </script>
+<script>
+/* Telemetry — no-ops silently when no backend (e.g. on Pages preview). */
+(function(){
+  if(typeof window.goTo!=='function')return;
+  const orig=window.goTo;
+  let last=Date.now();
+  function post(payload){
+    try{
+      const body=JSON.stringify(payload);
+      if(navigator.sendBeacon){
+        const blob=new Blob([body],{type:'application/json'});
+        navigator.sendBeacon('/api/event',blob);
+      }else{
+        fetch('/api/event',{method:'POST',headers:{'Content-Type':'application/json'},body,keepalive:true}).catch(function(){});
+      }
+    }catch(e){}
+  }
+  window.goTo=function(id){
+    const now=Date.now();
+    post({event:'phase_enter',phase:id,dwell_ms:now-last});
+    last=now;
+    return orig(id);
+  };
+  // emit an initial enter for the scene already shown at load
+  setTimeout(function(){post({event:'phase_enter',phase:'sceneIntro',dwell_ms:0});},0);
+  window.addEventListener('pagehide',function(){post({event:'session_end'});});
+})();
+</script>
 </body>
 </html>

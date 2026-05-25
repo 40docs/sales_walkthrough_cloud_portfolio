@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "walkthrough.fullname" . }}
+  labels: {{- include "walkthrough.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {{- include "walkthrough.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "walkthrough.selectorLabels" . | nindent 8 }}
+    spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: walkthrough
+          image: {{ include "walkthrough.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: LISTEN_ADDR
+              value: ":8080"
+            - name: PUBLIC_URL
+              value: {{ .Values.publicUrl | quote }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walkthrough.databaseSecretName" . }}
+                  key: uri
+            - name: JWT_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walkthrough.fullname" . }}-secrets
+                  key: jwtPrivateKey
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walkthrough.fullname" . }}-secrets
+                  key: adminToken
+            - name: IP_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walkthrough.fullname" . }}-secrets
+                  key: ipSalt
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}

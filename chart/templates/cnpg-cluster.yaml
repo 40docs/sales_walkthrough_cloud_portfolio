@@ -1,0 +1,27 @@
+{{- if .Values.postgres.cnpg.enabled }}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ include "walkthrough.fullname" . }}-pg
+  labels: {{- include "walkthrough.labels" . | nindent 4 }}
+spec:
+  instances: {{ .Values.postgres.cnpg.instances }}
+  storage:
+    size: {{ .Values.postgres.cnpg.storage.size }}
+    {{- with .Values.postgres.cnpg.storage.storageClass }}
+    storageClass: {{ . | quote }}
+    {{- end }}
+  bootstrap:
+    initdb:
+      database: walkthrough
+      owner: walkthrough
+{{- else if .Values.postgres.externalUrl }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "walkthrough.fullname" . }}-external-db
+  labels: {{- include "walkthrough.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  uri: {{ .Values.postgres.externalUrl | quote }}
+{{- end }}
